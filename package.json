@@ -1,0 +1,16 @@
+{
+  "name": "kagzso-identity-analysis",
+  "version": "1.0.0",
+  "description": "KYC Identity Document Scanner - Full Stack",
+  "scripts": {
+    "start": "concurrently \"npm run backend\" \"npm run frontend\"",
+    "backend": "python app.py",
+    "frontend": "npm --prefix frontend run dev",
+    "build": "npm --prefix frontend run build",
+    "install:frontend": "npm --prefix frontend install",
+    "setup": "pip install -r requirements.txt && npm run install:frontend"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
