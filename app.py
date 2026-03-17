@@ -44,7 +44,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Tesseract Configuration for Linux (Render) and Windows
+# Tesseract Configuration
 if os.name == 'nt':  # Windows
     pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 else:  # Linux (Render)
@@ -60,25 +60,25 @@ Task:
 Analyze the OCR text provided and extract information into a structured JSON format.
 
 Detection Rules:
-- Identify "document_type" as: "AADHAAR", "PAN CARD", "VOTER ID", "DRIVING LICENSE", "PASSPORT", or "UNKNOWN".
+- Identify "type" as: "AADHAAR", "PAN CARD", "VOTER ID", "DRIVING LICENSE", "PASSPORT", or "UNKNOWN".
 - Aadhaar: 12-digit number (xxxx xxxx xxxx).
 - PAN: 10-char alphanumeric (e.g., ABCDE1234F).
 - Voter ID: EPIC number.
 - DL: License number.
 
 Field Mapping:
-- name: Full name.
+- name: Full name of the person.
 - father_name: Father's or Spouse's name.
-- id_number: Primary ID number.
-- dob: Date of birth (DD-MM-YYYY).
-- location: Full address or state.
+- id_number: The primary ID number.
+- dob: Date of birth (DD-MM-YYYY or DD/MM/YYYY).
+- location: Full address or state/city.
 
 Return ONLY a JSON object. No markdown, no intro.
 If a field is missing, set it to "-".
 
 JSON Structure:
 {{
-  "document_type": "-",
+  "type": "-",
   "name": "-",
   "father_name": "-",
   "id_number": "-",
@@ -97,69 +97,97 @@ def preprocess_image(contents: bytes) -> np.ndarray:
     if img is None:
         return None
     
+    # 1. Grayscale
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # Binary thresholding + Otsu's thresholding
+    
+    # 2. Rescaling (Optional but helps)
+    # gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    
+    # 3. Thresholding (Binary + Otsu)
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
     return thresh
 
 def clean_ocr_text(text: str) -> str:
     """Pre-parse cleaning for common OCR errors."""
-    # Remove excessive newlines and weird symbols
-    text = re.sub(r'[^\w\s\-\/\:\.\,]', '', text)
+    # Basic cleaning
+    text = text.replace('|', 'I').replace('(', '').replace(')', '')
+    # Remove multiple spaces/newlines
     text = re.sub(r'\n+', '\n', text)
+    text = re.sub(r' +', ' ', text)
     return text.strip()
+
+def regex_extract_aadhaar(text: str):
+    """Fallback/Booster regex for Aadhaar documents."""
+    aadhaar_pattern = r'\d{4}\s\d{4}\s\d{4}'
+    dob_pattern = r'\d{2}/\d{2}/\d{4}'
+    
+    number = re.search(aadhaar_pattern, text)
+    dob = re.search(dob_pattern, text)
+    
+    return {
+        "id_number": number.group(0) if number else None,
+        "dob": dob.group(0) if dob else None
+    }
 
 def extract_text_from_pdf(contents: bytes) -> str:
     import fitz  # PyMuPDF
     doc = fitz.open(stream=contents, filetype="pdf")
     full_text = ""
     for page in doc:
-        # Increase resolution for better OCR
         mat = fitz.Matrix(2.0, 2.0)
         pix = page.get_pixmap(matrix=mat)
         img_bytes = pix.tobytes("png")
-        
         processed_img = preprocess_image(img_bytes)
-        full_text += pytesseract.image_to_string(processed_img, config='--psm 3') + "\n"
+        full_text += pytesseract.image_to_string(processed_img, config='--oem 3 --psm 6') + "\n"
     return full_text
 
-@app.get("/health")
+@app.get("/")
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "tesseract_path": pytesseract.pytesseract.tesseract_cmd}
+    return {"status": "ok", "tesseract": pytesseract.pytesseract.tesseract_cmd}
 
 @app.post("/scan")
 @app.post("/upload")
 @app.post("/api/scan")
-async def scan_document(file: UploadFile = File(...)):
-    logger.info(f"Received file: {file.filename}, Content-Type: {file.content_type}")
+async def upload_file(file: UploadFile = File(...)):
+    # Log file details
+    contents = await file.read()
+    file_size = len(contents)
+    logger.info(f"Incoming Request: File={file.filename}, Type={file.content_type}, Size={file_size} bytes")
     
     if not file.content_type.startswith(('image/', 'application/pdf')):
-        raise HTTPException(status_code=400, detail="Invalid file type. Please upload an image or PDF.")
+        raise HTTPException(status_code=400, detail="Unsupported file format.")
 
     try:
-        contents = await file.read()
-        
-        if file.content_type == "application/pdf" or file.filename.lower().endswith('.pdf'):
+        # OCR Processing
+        if file.content_type == "application/pdf":
             raw_text = extract_text_from_pdf(contents)
         else:
             processed_img = preprocess_image(contents)
             if processed_img is None:
-                raise ValueError("Failed to process image")
-            raw_text = pytesseract.image_to_string(processed_img, config='--psm 3')
+                raise ValueError("Could not decode image.")
+            # Use specific config as requested
+            raw_text = pytesseract.image_to_string(processed_img, config='--oem 3 --psm 6')
 
         raw_text = clean_ocr_text(raw_text)
-        logger.info(f"Extracted Raw Text Snippet: {raw_text[:200]}...")
+        logger.info(f"Extracted OCR Text snippet:\n{raw_text[:500]}")
 
         if not raw_text.strip():
-            logger.warning("No text detected in OCR process.")
+            logger.error("OCR extraction resulted in empty text.")
             return {
-                "name": "-", "father_name": "-", "id_number": "-", 
-                "dob": "-", "location": "-", "document_type": "UNKNOWN",
-                "error": "No text detected"
+                "type": "UNKNOWN",
+                "document_type": "UNKNOWN",
+                "name": "-",
+                "father_name": "-",
+                "id_number": "-",
+                "dob": "-",
+                "location": "-",
+                "address": "-",
+                "error": "Failed to extract text from document. Please ensure the image is clear."
             }
 
-        # Call Groq for intelligent parsing
+        # Intelligent Extraction with LLM (Groq)
         prompt = ID_PROMPT.format(raw_text=raw_text)
         
         completion = client.chat.completions.create(
@@ -171,40 +199,47 @@ async def scan_document(file: UploadFile = File(...)):
         
         result_json = completion.choices[0].message.content
         data = json.loads(result_json)
+        
+        # Add compatibility keys for frontend
+        data["document_type"] = data.get("type", "-")
+        data["address"] = data.get("location", "-")
         data["filename"] = file.filename
         
-        logger.info(f"Parsed Result: {data}")
+        # Verify Aadhaar with regex if type is Aadhaar
+        if data.get("type") == "AADHAAR" or "Aadhaar" in raw_text:
+            reg_data = regex_extract_aadhaar(raw_text)
+            if reg_data["id_number"] and data["id_number"] == "-":
+                data["id_number"] = reg_data["id_number"]
+            if reg_data["dob"] and data["dob"] == "-":
+                data["dob"] = reg_data["dob"]
+
+        logger.info(f"Final Data: {data}")
         session_history.append(data)
         
         return data
 
     except Exception as e:
-        logger.error(f"Processing Error: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error processing document: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal Server Error during OCR processing.")
 
 @app.get("/export")
 @app.get("/api/export")
 async def export_excel():
     if not session_history:
-        raise HTTPException(status_code=400, detail="No scan data available.")
-
-    try:
-        df = pd.DataFrame(session_history)
-        file_path = BASE_DIR / "scan_results.xlsx"
-        df.to_excel(file_path, index=False)
-        return FileResponse(path=file_path, filename="extracted_data.xlsx")
-    except Exception as e:
-        logger.error(f"Export Error: {e}")
-        raise HTTPException(status_code=500, detail="Export failed")
+        return {"error": "No data available."}
+    df = pd.DataFrame(session_history)
+    file_path = "session_data.xlsx"
+    df.to_excel(file_path, index=False)
+    return FileResponse(file_path, filename="Kagzso_Extraction.xlsx")
 
 @app.delete("/clear")
-@app.delete("/api/clear")
-async def clear_history():
+async def clear():
     global session_history
     session_history = []
-    return {"message": "History cleared"}
+    return {"status": "cleared"}
 
 if __name__ == "__main__":
     import uvicorn
+    # Render uses the PORT environment variable
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
