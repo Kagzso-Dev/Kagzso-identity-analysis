@@ -7,3 +7,6 @@ pillow
 python-dotenv
 pandas
 openpyxl
+opencv-python-headless
+pymupdf
+numpy
