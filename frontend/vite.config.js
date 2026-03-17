@@ -6,10 +6,7 @@ export default defineConfig({
   plugins: [react()],
   server: {
     proxy: {
-      '/scan': 'http://localhost:8000',
-      '/export': 'http://localhost:8000',
-      '/clear': 'http://localhost:8000',
-      '/health': 'http://localhost:8000',
+      '/api': 'http://localhost:10000',
     }
   }
 })

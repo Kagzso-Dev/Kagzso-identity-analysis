@@ -24,7 +24,10 @@ session_history = []
 # Enable CORS for React frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://kagzso-identity.netlify.app",
+        "http://localhost:5173",  # Vite dev server
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -80,7 +83,7 @@ OCR TEXT FROM IMAGE:
 {raw_text}
 """
 
-@app.get("/health")
+@app.get("/api/health")
 async def health():
     return {"status": "ok"}
 
@@ -96,7 +99,7 @@ def extract_text_from_pdf(contents: bytes) -> str:
     return full_text
 
 
-@app.post("/scan")
+@app.post("/api/scan")
 async def scan_document(file: UploadFile = File(...)):
     try:
         contents = await file.read()
@@ -134,7 +137,7 @@ async def scan_document(file: UploadFile = File(...)):
         print(f"Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/export")
+@app.get("/api/export")
 async def export_excel():
     if not session_history:
         raise HTTPException(status_code=400, detail="No scan data available to export.")
@@ -155,7 +158,7 @@ async def export_excel():
         print(f"Export Error: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate Excel file.")
 
-@app.delete("/clear")
+@app.delete("/api/clear")
 async def clear_history():
     global session_history
     session_history = []
@@ -163,4 +166,4 @@ async def clear_history():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
