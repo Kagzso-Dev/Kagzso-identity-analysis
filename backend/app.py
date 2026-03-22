@@ -1,3 +1,4 @@
+# Standard library imports only at top level for resilience
 import os
 import io
 import json
@@ -6,11 +7,6 @@ import re
 from pathlib import Path
 from typing import List, Optional
 
-import cv2
-import numpy as np
-import pandas as pd
-import pytesseract
-from PIL import Image
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -45,11 +41,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Tesseract Configuration
-if os.name == 'nt':  # Windows
-    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-else:  # Linux (Render)
-    pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
+# Tesseract Configuration will happen inside functions as needed
 
 # Initialize Groq client
 try:
@@ -96,8 +88,15 @@ OCR TEXT:
 {raw_text}
 """
 
-def preprocess_image(contents: bytes) -> np.ndarray:
+def preprocess_image(contents: bytes):
     """Apply grayscale, upscaling, and adaptive thresholding for better OCR results."""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        logger.error("OpenCV or NumPy not found.")
+        return None
+
     nparr = np.frombuffer(contents, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None:
@@ -106,11 +105,10 @@ def preprocess_image(contents: bytes) -> np.ndarray:
     # 1. Grayscale
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # 2. Upscale 2x — significantly improves OCR on small/compressed images
+    # 2. Upscale 2x
     gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
 
-    # 3. Adaptive thresholding — handles varied lighting and colored backgrounds
-    #    better than Otsu's global threshold (which destroys colored ID cards)
+    # 3. Adaptive thresholding
     thresh = cv2.adaptiveThreshold(
         gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 2
     )
@@ -154,31 +152,24 @@ def extract_text_from_pdf(contents: bytes) -> str:
 
 @app.get("/")
 async def root():
-    return {"message": "Kagzso Identity API is online", "docs": "/docs"}
+    return {"status": "ok", "message": "Kagzso Identity API is online"}
 
 @app.get("/api/health")
 async def health():
-    try:
-        tesseract_ver = "unknown"
-        try:
-            import pytesseract
-            tesseract_ver = pytesseract.get_tesseract_version()
-        except:
-            pass
-            
-        return {
-            "status": "ok",
-            "message": "Kagzso Identity API is running normally",
-            "tesseract_version": str(tesseract_ver)
-        }
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        return {"status": "ok", "message": "API is online, but health check encountered an issue"}
+    return {"status": "ok", "message": "healthy"}
 
 @app.post("/scan")
 @app.post("/upload")
 @app.post("/api/scan")
 async def upload_file(file: UploadFile = File(...)):
+    import pytesseract
+    import numpy as np
+    import cv2
+    if os.name == 'nt':
+        pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    else:
+        pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
+
     # Log file details
     contents = await file.read()
     file_size = len(contents)
@@ -261,6 +252,7 @@ async def upload_file(file: UploadFile = File(...)):
 @app.get("/export")
 @app.get("/api/export")
 async def export_excel():
+    import pandas as pd
     if not session_history:
         return {"error": "No data available."}
     df = pd.DataFrame(session_history)
