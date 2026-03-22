@@ -1,6 +1,5 @@
 fastapi
 uvicorn[standard]
-gunicorn
 python-multipart
 groq
 pytesseract
@@ -11,4 +10,3 @@ openpyxl
 opencv-python-headless
 pymupdf
 numpy
-a2wsgi
