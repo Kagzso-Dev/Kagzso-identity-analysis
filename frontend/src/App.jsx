@@ -412,12 +412,26 @@ function App() {
   }
 
   return (
-    <div className="container" style={{ position: 'relative' }}>
-      <div style={{ position: 'absolute', top: '20px', right: '20px', zIndex: 10 }}>
+    <div className="container">
+
+      {/* ── Top bar: logo + sign-out in one row ── */}
+      <header className="top-bar">
+        <div className="brand-row">
+          <div className="logo-circle top-bar-logo">
+            <img src={logo} alt="Kagzso Logo" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+          </div>
+          <div className="brand-text">
+            <h1 className="logo-text">Kagzso</h1>
+            <div className="status-row">
+              <span className={`status-dot status-dot--${serverStatus}`} />
+              <span className="status-label">System {serverStatus}</span>
+            </div>
+          </div>
+        </div>
+
         <button
           onClick={() => { sessionStorage.removeItem('kagzso_auth'); setIsLoggedIn(false); }}
-          className="btn-secondary"
-          style={{ width: 'auto', padding: '8px 16px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px', borderRadius: '10px' }}
+          className="btn-secondary signout-btn"
         >
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
             <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
@@ -426,25 +440,9 @@ function App() {
           </svg>
           Sign Out
         </button>
-      </div>
+      </header>
 
-      <div className="brand-section">
-        <div className="brand-row">
-          <div className="logo-circle" style={{ width: '48px', height: '48px', flexShrink: 0 }}>
-            <img src={logo} alt="Kagzso Logo" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-          </div>
-          <div className="brand-text">
-            <h1 className="logo-text" style={{ marginBottom: '2px' }}>Kagzso</h1>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-              <div style={{ width: '7px', height: '7px', borderRadius: '50%', background: serverStatus === 'online' ? '#10b981' : serverStatus === 'offline' ? '#ef4444' : '#94a3b8', boxShadow: serverStatus === 'online' ? '0 0 8px #10b981' : 'none', flexShrink: 0 }}></div>
-              <span style={{ fontSize: '10px', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '1px' }}>
-                System {serverStatus}
-              </span>
-            </div>
-          </div>
-        </div>
-        <p className="subtitle" style={{ marginTop: '12px' }}>AUTOMATED BATCH DOCUMENT ANALYZER</p>
-      </div>
+      <p className="subtitle">AUTOMATED BATCH DOCUMENT ANALYZER</p>
 
       {/* Hidden file inputs */}
       <input ref={imageInputRef} type="file" accept="image/jpeg,image/png,image/webp" multiple hidden

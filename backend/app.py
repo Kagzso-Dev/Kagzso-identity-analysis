@@ -1,3 +1,4 @@
+import io
 import os
 import base64
 import json
@@ -10,6 +11,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from groq import Groq
+from PIL import Image
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -47,6 +49,79 @@ try:
 except Exception as e:
     logger.error(f"Failed to initialize Groq client: {e}")
     client = None
+
+# ---------------------------------------------------------------------------
+# Image normalisation — handles any size / format before processing
+# ---------------------------------------------------------------------------
+
+# Target longest side for Vision API (keeps payload fast and under limits)
+VISION_MAX_DIM = 1600
+# Target shortest side for Tesseract (300 DPI equivalent for a credit-card doc)
+TESSERACT_MIN_SHORT = 900
+# Hard cap on upscale factor to avoid OOM on huge originals
+TESSERACT_MAX_SCALE = 4.0
+
+
+def normalise_for_vision(contents: bytes) -> tuple[bytes, str]:
+    """
+    Convert any image format → JPEG, resize so longest side ≤ VISION_MAX_DIM.
+    Returns (jpeg_bytes, 'image/jpeg').
+    Falls back to the original bytes on any error.
+    """
+    try:
+        img = Image.open(io.BytesIO(contents))
+        # Flatten transparency / palette modes
+        if img.mode in ("RGBA", "P", "LA"):
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            bg.paste(img, mask=img.split()[-1] if img.mode in ("RGBA", "LA") else None)
+            img = bg
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+
+        w, h = img.size
+        longest = max(w, h)
+        if longest > VISION_MAX_DIM:
+            scale = VISION_MAX_DIM / longest
+            img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+            logger.info(f"Vision resize: {w}x{h} → {img.width}x{img.height}")
+
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=88, optimize=True)
+        result = buf.getvalue()
+        logger.info(f"Vision image prepared: {len(contents)//1024}KB → {len(result)//1024}KB")
+        return result, "image/jpeg"
+
+    except Exception as e:
+        logger.warning(f"normalise_for_vision failed ({e}); using original bytes.")
+        return contents, "image/jpeg"
+
+
+def normalise_for_tesseract(contents: bytes) -> bytes:
+    """
+    Upscale small images so the shortest side reaches TESSERACT_MIN_SHORT pixels.
+    Large images are left unchanged (Tesseract handles them fine natively).
+    Returns PNG bytes for lossless OCR input.
+    """
+    try:
+        img = Image.open(io.BytesIO(contents))
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+
+        w, h = img.size
+        shortest = min(w, h)
+        if shortest < TESSERACT_MIN_SHORT:
+            scale = min(TESSERACT_MIN_SHORT / shortest, TESSERACT_MAX_SCALE)
+            new_w, new_h = int(w * scale), int(h * scale)
+            img = img.resize((new_w, new_h), Image.LANCZOS)
+            logger.info(f"Tesseract upscale: {w}x{h} → {new_w}x{new_h} (×{scale:.2f})")
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    except Exception as e:
+        logger.warning(f"normalise_for_tesseract failed ({e}); using original bytes.")
+        return contents
 
 # ---------------------------------------------------------------------------
 # Prompts
@@ -95,7 +170,7 @@ OCR TEXT:
 {raw_text}"""
 
 # ---------------------------------------------------------------------------
-# Groq Vision extraction — PRIMARY method (no Tesseract required)
+# Groq Vision extraction — PRIMARY (no Tesseract required)
 # ---------------------------------------------------------------------------
 
 VISION_MODELS = [
@@ -103,18 +178,19 @@ VISION_MODELS = [
     "llama-3.2-90b-vision-preview",
 ]
 
-def extract_with_vision(contents: bytes, content_type: str) -> dict | None:
-    """Try each Groq Vision model in sequence; return first successful result."""
+
+def extract_with_vision(contents: bytes) -> dict | None:
+    """Normalise image to optimal size then try each Vision model in sequence."""
     if client is None or not _groq_api_key:
-        logger.warning("Vision extraction skipped: Groq client not ready or API key missing.")
+        logger.warning("Vision skipped: Groq client not ready or API key missing.")
         return None
 
-    mime = content_type if content_type in ("image/jpeg", "image/png", "image/webp", "image/gif") else "image/jpeg"
-    b64 = base64.b64encode(contents).decode("utf-8")
+    vision_bytes, mime = normalise_for_vision(contents)
+    b64 = base64.b64encode(vision_bytes).decode("utf-8")
 
     for model in VISION_MODELS:
         try:
-            logger.info(f"Trying Groq Vision model: {model}")
+            logger.info(f"Trying vision model: {model}")
             completion = client.chat.completions.create(
                 model=model,
                 messages=[{
@@ -129,25 +205,24 @@ def extract_with_vision(contents: bytes, content_type: str) -> dict | None:
             )
 
             raw = completion.choices[0].message.content.strip()
-            logger.info(f"Vision ({model}) raw response: {raw[:400]}")
+            logger.info(f"Vision ({model}) response: {raw[:400]}")
 
             match = re.search(r'\{.*\}', raw, re.DOTALL)
             if match:
                 data = json.loads(match.group(0))
-                logger.info(f"Vision extraction result ({model}): {data}")
+                logger.info(f"Vision result ({model}): {data}")
                 return data
 
-            logger.warning(f"Vision model {model} returned no JSON object.")
+            logger.warning(f"Vision model {model} returned no JSON.")
 
         except Exception as e:
             logger.error(f"Vision model {model} failed: {e}")
-            # Try next model
 
     logger.error("All vision models failed.")
     return None
 
 # ---------------------------------------------------------------------------
-# Tesseract OCR — FALLBACK (local dev only; not installed on Render Python runtime)
+# Tesseract OCR — FALLBACK
 # ---------------------------------------------------------------------------
 
 def tesseract_available() -> bool:
@@ -158,44 +233,51 @@ def tesseract_available() -> bool:
     except Exception:
         return False
 
-def preprocess_image_variants(contents: bytes) -> list:
+
+def preprocess_image_variants(img_bytes: bytes) -> list:
+    """
+    Build multiple OpenCV preprocessed variants from already-normalised image bytes.
+    The input should already be at the right resolution (normalise_for_tesseract first).
+    """
     try:
         import cv2
         import numpy as np
     except ImportError:
         return []
 
-    nparr = np.frombuffer(contents, np.uint8)
+    nparr = np.frombuffer(img_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None:
         return []
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    upscaled = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-
     variants = []
 
-    # block=11 is correct for fine ID-card text (31 is too coarse)
+    # Adaptive threshold — block=11 is best for fine ID-card text
     thresh_adapt = cv2.adaptiveThreshold(
-        upscaled, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
     )
     variants.append(thresh_adapt)
 
-    _, thresh_otsu = cv2.threshold(upscaled, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # OTSU — works well under even lighting
+    _, thresh_otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     variants.append(thresh_otsu)
 
-    denoised = cv2.fastNlMeansDenoising(upscaled, h=10)
+    # Denoised + adaptive — reduces JPEG compression artifacts
+    denoised = cv2.fastNlMeansDenoising(gray, h=10)
     thresh_denoised = cv2.adaptiveThreshold(
         denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
     )
     variants.append(thresh_denoised)
 
-    variants.append(upscaled)
+    # Plain grayscale — sometimes cleaner than thresholded
     variants.append(gray)
 
     return variants
 
+
 def run_tesseract_ocr(contents: bytes) -> str:
+    """Normalise image size then run Tesseract across all variants + PSM modes."""
     import pytesseract
 
     if os.name == "nt":
@@ -203,7 +285,9 @@ def run_tesseract_ocr(contents: bytes) -> str:
     else:
         pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
-    variants = preprocess_image_variants(contents)
+    # Upscale small images to give Tesseract enough resolution
+    normalised = normalise_for_tesseract(contents)
+    variants = preprocess_image_variants(normalised)
     if not variants:
         logger.error("Could not generate image variants for Tesseract.")
         return ""
@@ -217,16 +301,16 @@ def run_tesseract_ocr(contents: bytes) -> str:
                 candidate = pytesseract.image_to_string(img, config=psm)
                 if len(candidate.strip()) > len(best.strip()):
                     best = candidate
-                    logger.info(f"Tesseract update: variant={i} psm={psm} chars={len(best.strip())}")
+                    logger.info(f"Tesseract improved: variant={i} psm={psm} chars={len(best.strip())}")
             except Exception as e:
-                logger.warning(f"Tesseract attempt failed (variant={i}, {psm}): {e}")
+                logger.warning(f"Tesseract failed (variant={i}, {psm}): {e}")
         if len(best.strip()) >= 60:
             break
 
     return best
 
+
 def llm_from_ocr_text(raw_text: str) -> dict | None:
-    """Send raw OCR text to Groq LLM for structured extraction."""
     if client is None or not raw_text.strip():
         return None
     try:
@@ -244,7 +328,7 @@ def llm_from_ocr_text(raw_text: str) -> dict | None:
         return None
 
 # ---------------------------------------------------------------------------
-# PDF extraction — uses PyMuPDF native text layer (no Tesseract needed for digital PDFs)
+# PDF extraction — native text layer + Tesseract for scanned pages
 # ---------------------------------------------------------------------------
 
 def extract_pdf_text(contents: bytes) -> str:
@@ -254,37 +338,37 @@ def extract_pdf_text(contents: bytes) -> str:
     full_text = ""
 
     for page_num, page in enumerate(doc):
-        # Native text layer (works for digital/selectable PDFs — no Tesseract)
         text = page.get_text("text").strip()
         if text:
-            logger.info(f"PDF page {page_num}: extracted {len(text)} chars via native text layer.")
+            logger.info(f"PDF page {page_num}: {len(text)} chars (native text layer).")
             full_text += text + "\n"
         else:
-            # Scanned page — try Tesseract if available
-            logger.warning(f"PDF page {page_num}: no native text. Checking Tesseract availability.")
+            logger.warning(f"PDF page {page_num}: no native text — trying Tesseract.")
             if tesseract_available():
                 try:
                     import pytesseract
                     pytesseract.pytesseract.tesseract_cmd = (
-                        r"C:\Program Files\Tesseract-OCR\tesseract.exe" if os.name == "nt" else "/usr/bin/tesseract"
+                        r"C:\Program Files\Tesseract-OCR\tesseract.exe" if os.name == "nt"
+                        else "/usr/bin/tesseract"
                     )
+                    # Render at 2x then normalise
                     mat = fitz.Matrix(2.0, 2.0)
                     pix = page.get_pixmap(matrix=mat)
-                    img_bytes = pix.tobytes("png")
+                    img_bytes = normalise_for_tesseract(pix.tobytes("png"))
                     variants = preprocess_image_variants(img_bytes)
                     if variants:
                         ocr_text = pytesseract.image_to_string(variants[0], config="--oem 3 --psm 6")
                         full_text += ocr_text + "\n"
-                        logger.info(f"PDF page {page_num}: Tesseract extracted {len(ocr_text)} chars.")
+                        logger.info(f"PDF page {page_num}: Tesseract got {len(ocr_text)} chars.")
                 except Exception as e:
-                    logger.warning(f"PDF Tesseract fallback failed on page {page_num}: {e}")
+                    logger.warning(f"PDF Tesseract failed on page {page_num}: {e}")
             else:
-                logger.warning(f"PDF page {page_num} is scanned but Tesseract is not available on this host.")
+                logger.warning(f"PDF page {page_num} is scanned but Tesseract is not available.")
 
     return full_text.strip()
 
 # ---------------------------------------------------------------------------
-# Regex boost for Aadhaar
+# Helpers
 # ---------------------------------------------------------------------------
 
 def clean_ocr_text(text: str) -> str:
@@ -292,6 +376,7 @@ def clean_ocr_text(text: str) -> str:
     text = re.sub(r"\n+", "\n", text)
     text = re.sub(r" +", " ", text)
     return text.strip()
+
 
 def regex_boost(data: dict, raw_text: str) -> dict:
     aadhaar_re = r'\d{4}[\s\-]\d{4}[\s\-]\d{4}'
@@ -311,8 +396,9 @@ def regex_boost(data: dict, raw_text: str) -> dict:
 
     return data
 
+
 def empty_response(filename: str, reason: str) -> dict:
-    logger.error(f"Returning UNKNOWN for '{filename}'. Reason: {reason}")
+    logger.error(f"UNKNOWN result for '{filename}': {reason}")
     return {
         "type": "UNKNOWN", "document_type": "UNKNOWN",
         "name": "-", "father_name": "-", "id_number": "-",
@@ -328,6 +414,7 @@ def empty_response(filename: str, reason: str) -> dict:
 async def root():
     return {"status": "ok", "message": "Kagzso Identity API is online"}
 
+
 @app.get("/api/health")
 async def health():
     return {
@@ -337,20 +424,27 @@ async def health():
         "groq_client_initialized": client is not None,
         "groq_api_key_set": bool(_groq_api_key),
         "vision_models": VISION_MODELS,
+        "vision_max_dim": VISION_MAX_DIM,
+        "tesseract_min_short": TESSERACT_MIN_SHORT,
     }
+
 
 @app.post("/scan")
 @app.post("/upload")
 @app.post("/api/scan")
 async def upload_file(file: UploadFile = File(...)):
     contents = await file.read()
-    logger.info(f"--- Upload --- file={file.filename!r} type={file.content_type} size={len(contents)} bytes")
+    size_kb = len(contents) // 1024
+    logger.info(f"--- Upload --- file={file.filename!r} type={file.content_type} size={size_kb}KB")
 
     if not file.content_type.startswith(("image/", "application/pdf")):
         raise HTTPException(status_code=400, detail="Unsupported file type. Send an image or PDF.")
 
     if client is None or not _groq_api_key:
-        raise HTTPException(status_code=503, detail="GROQ_API_KEY is not set. Set it in Render → Environment Variables.")
+        raise HTTPException(
+            status_code=503,
+            detail="GROQ_API_KEY is not set. Add it in Render → Environment Variables."
+        )
 
     try:
         data = None
@@ -361,16 +455,18 @@ async def upload_file(file: UploadFile = File(...)):
             logger.info(f"PDF text ({len(raw_text)} chars):\n{raw_text[:500]}")
 
             if not raw_text.strip():
-                return empty_response(file.filename, "Could not extract text from PDF. It may be a fully scanned PDF without a text layer and Tesseract is unavailable on this host.")
-
+                return empty_response(
+                    file.filename,
+                    "Could not extract text from PDF. It may be fully scanned and Tesseract is unavailable."
+                )
             data = llm_from_ocr_text(raw_text)
 
         # ── IMAGE ─────────────────────────────────────────────────────────────
         else:
-            # Step 1: Groq Vision (primary — works everywhere, no Tesseract needed)
-            data = extract_with_vision(contents, file.content_type)
+            # Step 1: Groq Vision (primary — works on Render without Tesseract)
+            data = extract_with_vision(contents)
 
-            # Step 2: Tesseract + LLM fallback (works locally; also on Render after buildCommand fix)
+            # Step 2: Tesseract + LLM (available locally and on Render after buildCommand fix)
             if data is None or data.get("type") == "UNKNOWN":
                 logger.info("Vision returned UNKNOWN/None — trying Tesseract fallback.")
                 if tesseract_available():
@@ -378,7 +474,6 @@ async def upload_file(file: UploadFile = File(...)):
                     logger.info(f"Tesseract OCR ({len(raw_text)} chars):\n{raw_text[:500]}")
                     if raw_text.strip():
                         fallback = llm_from_ocr_text(raw_text)
-                        # Accept Tesseract result if it extracted ANY real field, even if type=UNKNOWN
                         if fallback:
                             has_data = any(
                                 fallback.get(f, "-") not in ("-", "", None)
@@ -388,16 +483,16 @@ async def upload_file(file: UploadFile = File(...)):
                                 data = fallback
                                 logger.info("Using Tesseract+LLM result.")
                 else:
-                    logger.warning("Tesseract not available on this host — Vision API is the only extraction path.")
+                    logger.warning("Tesseract not available — Vision is the only extraction path.")
 
         if not data:
             tess = tesseract_available()
-            key_ok = bool(_groq_api_key)
             return empty_response(
                 file.filename,
-                f"All extraction methods failed. "
-                f"[groq_key={'SET' if key_ok else 'MISSING'}, tesseract={'available' if tess else 'not installed'}] "
-                f"Try a clearer image or check server logs."
+                f"All extraction methods failed "
+                f"[groq_key={'SET' if _groq_api_key else 'MISSING'}, "
+                f"tesseract={'ok' if tess else 'not installed'}]. "
+                f"Try a clearer image or check Render logs."
             )
 
         # Normalise keys for frontend
@@ -405,7 +500,7 @@ async def upload_file(file: UploadFile = File(...)):
         data["address"] = data.get("location", "-")
         data["filename"] = file.filename
 
-        # Regex boost: recover Aadhaar number/DOB if model missed them
+        # Regex boost: recover Aadhaar number / DOB if model missed them
         if data.get("type") in ("AADHAAR", "UNKNOWN"):
             combined = " ".join(str(v) for v in data.values())
             data = regex_boost(data, combined)
@@ -420,6 +515,7 @@ async def upload_file(file: UploadFile = File(...)):
         logger.error(f"Unhandled error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
+
 @app.get("/export")
 @app.get("/api/export")
 async def export_excel():
@@ -431,11 +527,13 @@ async def export_excel():
     df.to_excel(file_path, index=False)
     return FileResponse(file_path, filename="Kagzso_Extraction.xlsx")
 
+
 @app.delete("/clear")
 @app.delete("/api/clear")
 async def clear():
     session_history.clear()
     return {"status": "cleared"}
+
 
 if __name__ == "__main__":
     import uvicorn
