@@ -39,8 +39,8 @@ origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -52,7 +52,11 @@ else:  # Linux (Render)
     pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
 # Initialize Groq client
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+try:
+    client = Groq(api_key=os.environ.get("GROQ_API_KEY") or "MISSING_KEY")
+except Exception as e:
+    logger.error(f"Failed to initialize Groq client: {e}")
+    client = None
 
 ID_PROMPT = """
 You are an expert Indian KYC document extractor. OCR text from scanned identity cards is often noisy with missing spaces, garbled characters, or mixed Hindi/English words.

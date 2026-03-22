@@ -2,7 +2,8 @@ import React, { useState, useRef, useEffect } from 'react';
 import axios from 'axios';
 import logo from './assets/logo.png';
 
-const API_URL = `${import.meta.env.VITE_API_URL || ''}/api`;
+const rawBaseUrl = (import.meta.env.VITE_API_URL || '').replace(/\/$/, "");
+const API_URL = `${rawBaseUrl || ''}/api`;
 const CREDENTIALS = { username: 'Kagzso', password: 'Kagzso@123' };
 
 const MAX_ATTEMPTS = 5;
@@ -248,13 +249,13 @@ function App() {
     const checkServer = async () => {
       try {
         const res = await fetch(`${API_URL}/health`);
-        const status = (res.ok || res.status < 500) ? 'online' : 'offline';
+        const status = res.ok ? 'online' : 'offline';
         if (!cancelled) { serverStatusRef.current = status; setServerStatus(status); }
       } catch {
         if (!cancelled) { serverStatusRef.current = 'offline'; setServerStatus('offline'); }
       }
       if (!cancelled) {
-        timeoutId = setTimeout(checkServer, serverStatusRef.current === 'online' ? 10_000 : 60_000);
+        timeoutId = setTimeout(checkServer, 10_000); // Check every 10s to catch cold starts faster
       }
     };
     checkServer();
