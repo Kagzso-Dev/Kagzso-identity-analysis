@@ -30,12 +30,13 @@ origins = [
     "https://kagzso-identity-analysis.vercel.app",
     "https://kagzso-identity.netlify.app",
     "http://localhost:5173",
+    "http://localhost:5174",
     "http://localhost:3000",
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -140,6 +141,11 @@ def regex_extract_aadhaar(text: str):
 
 def extract_text_from_pdf(contents: bytes) -> str:
     import fitz  # PyMuPDF
+    import pytesseract
+    if os.name == 'nt':
+        pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    else:
+        pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
     doc = fitz.open(stream=contents, filetype="pdf")
     full_text = ""
     for page in doc:
@@ -215,8 +221,11 @@ async def upload_file(file: UploadFile = File(...)):
             }
 
         # Intelligent Extraction with LLM (Groq)
+        if client is None:
+            raise HTTPException(status_code=503, detail="AI service unavailable: Groq client not initialized. Check GROQ_API_KEY.")
+
         prompt = ID_PROMPT.format(raw_text=raw_text)
-        
+
         completion = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
@@ -256,7 +265,7 @@ async def export_excel():
     if not session_history:
         return {"error": "No data available."}
     df = pd.DataFrame(session_history)
-    file_path = "session_data.xlsx"
+    file_path = str(BASE_DIR / "session_data.xlsx")
     df.to_excel(file_path, index=False)
     return FileResponse(file_path, filename="Kagzso_Extraction.xlsx")
 
@@ -269,6 +278,6 @@ async def clear():
 
 if __name__ == "__main__":
     import uvicorn
-    # Render uses the PORT environment variable, defaults to 10000 for Render
-    port = int(os.environ.get("PORT", 10000))
+    # Render injects PORT env var; locally defaults to 8000 to avoid conflicts
+    port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
