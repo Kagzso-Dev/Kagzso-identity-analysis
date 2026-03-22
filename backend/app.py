@@ -465,7 +465,7 @@ async def preflight_handler():
     """Explicit OPTIONS handler so CORS preflight always gets 200."""
     return {}
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
     return {"status": "ok", "message": "Kagzso Identity API is online"}
 
