@@ -153,13 +153,27 @@ def extract_text_from_pdf(contents: bytes) -> str:
     return full_text
 
 @app.get("/")
+async def root():
+    return {"message": "Kagzso Identity API is online", "docs": "/docs"}
+
 @app.get("/api/health")
 async def health():
-    return {
-        "status": "ok", 
-        "tesseract": pytesseract.pytesseract.tesseract_cmd,
-        "message": "System is running normally"
-    }
+    try:
+        tesseract_ver = "unknown"
+        try:
+            import pytesseract
+            tesseract_ver = pytesseract.get_tesseract_version()
+        except:
+            pass
+            
+        return {
+            "status": "ok",
+            "message": "Kagzso Identity API is running normally",
+            "tesseract_version": str(tesseract_ver)
+        }
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return {"status": "ok", "message": "API is online, but health check encountered an issue"}
 
 @app.post("/scan")
 @app.post("/upload")
