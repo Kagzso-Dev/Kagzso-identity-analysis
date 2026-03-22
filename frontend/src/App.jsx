@@ -3,8 +3,229 @@ import axios from 'axios';
 import logo from './assets/logo.png';
 
 const API_URL = `${import.meta.env.VITE_API_URL || ''}/api`;
+const CREDENTIALS = { username: 'Kagzso', password: 'Kagzso@123' };
+
+const MAX_ATTEMPTS = 5;
+const LOCKOUT_SECONDS = 30;
+
+function Login({ onLogin }) {
+  const [username, setUsername]       = useState('');
+  const [password, setPassword]       = useState('');
+  const [showPassword, setShowPass]   = useState(false);
+  const [submitting, setSubmitting]   = useState(false);
+  const [error, setError]             = useState('');
+  const [shaking, setShaking]         = useState(false);
+  const [attempts, setAttempts]       = useState(0);
+  const [lockoutLeft, setLockoutLeft] = useState(0);
+  const usernameRef = useRef(null);
+
+  // Auto-focus username on mount
+  useEffect(() => { usernameRef.current?.focus(); }, []);
+
+  // Lockout countdown
+  useEffect(() => {
+    if (lockoutLeft <= 0) return;
+    const id = setTimeout(() => setLockoutLeft(s => s - 1), 1000);
+    return () => clearTimeout(id);
+  }, [lockoutLeft]);
+
+  const shake = () => {
+    setShaking(true);
+    setTimeout(() => setShaking(false), 520);
+  };
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    if (lockoutLeft > 0 || submitting) return;
+
+    if (!username.trim() || !password) {
+      setError('Please fill in all fields.');
+      shake();
+      return;
+    }
+
+    setSubmitting(true);
+    setError('');
+
+    // Simulate a short auth delay — feels trustworthy, prevents timing attacks
+    setTimeout(() => {
+      if (username === CREDENTIALS.username && password === CREDENTIALS.password) {
+        sessionStorage.setItem('kagzso_auth', '1');
+        setAttempts(0);
+        onLogin();
+      } else {
+        const next = attempts + 1;
+        setAttempts(next);
+        if (next >= MAX_ATTEMPTS) {
+          setLockoutLeft(LOCKOUT_SECONDS);
+          setError(`Too many failed attempts. Locked for ${LOCKOUT_SECONDS}s.`);
+        } else {
+          setError(`Invalid credentials. ${MAX_ATTEMPTS - next} attempt${MAX_ATTEMPTS - next !== 1 ? 's' : ''} remaining.`);
+        }
+        shake();
+        setSubmitting(false);
+      }
+    }, 700);
+  };
+
+  const locked = lockoutLeft > 0;
+
+  return (
+    <div className="login-page">
+      <div className={`login-card${shaking ? ' login-shake' : ''}`}>
+
+        {/* Brand */}
+        <div className="login-brand">
+          <div className="logo-circle" style={{ margin: '0 auto 18px', width: '84px', height: '84px' }}>
+            <img src={logo} alt="Kagzso Logo" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+          </div>
+          <h1 className="logo-text" style={{ fontSize: '34px', marginBottom: '6px' }}>Kagzso</h1>
+          <p style={{ color: 'var(--text-secondary)', fontSize: '10px', letterSpacing: '3.5px', textTransform: 'uppercase' }}>
+            Identity Analysis Platform
+          </p>
+        </div>
+
+        {/* Divider */}
+        <div style={{ height: '1px', background: 'var(--card-border)', margin: '24px 0' }} />
+
+        <form onSubmit={handleSubmit} className="login-form" noValidate>
+
+          {/* Username */}
+          <div className="login-field">
+            <label htmlFor="l-user">Username</label>
+            <input
+              id="l-user"
+              ref={usernameRef}
+              type="text"
+              autoComplete="username"
+              placeholder="Enter username"
+              value={username}
+              disabled={locked || submitting}
+              onChange={e => { setUsername(e.target.value); setError(''); }}
+            />
+          </div>
+
+          {/* Password */}
+          <div className="login-field">
+            <label htmlFor="l-pass">Password</label>
+            <div className="password-wrap">
+              <input
+                id="l-pass"
+                type={showPassword ? 'text' : 'password'}
+                autoComplete="current-password"
+                placeholder="Enter password"
+                value={password}
+                disabled={locked || submitting}
+                onChange={e => { setPassword(e.target.value); setError(''); }}
+              />
+              <button
+                type="button"
+                className="eye-btn"
+                onClick={() => setShowPass(v => !v)}
+                tabIndex={-1}
+                aria-label={showPassword ? 'Hide password' : 'Show password'}
+                disabled={locked || submitting}
+              >
+                {showPassword ? (
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/>
+                    <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/>
+                    <line x1="1" y1="1" x2="23" y2="23"/>
+                  </svg>
+                ) : (
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                    <circle cx="12" cy="12" r="3"/>
+                  </svg>
+                )}
+              </button>
+            </div>
+          </div>
+
+          {/* Error / Lockout */}
+          {(error || locked) && (
+            <div className={`login-error${locked ? ' login-error--locked' : ''}`}>
+              {locked
+                ? <>Locked — retry in <strong>{lockoutLeft}s</strong></>
+                : error}
+            </div>
+          )}
+
+          {/* Attempt dots */}
+          {attempts > 0 && !locked && (
+            <div className="attempt-dots" aria-label={`${attempts} failed attempt(s)`}>
+              {Array.from({ length: MAX_ATTEMPTS }).map((_, i) => (
+                <span key={i} className={`attempt-dot${i < attempts ? ' attempt-dot--used' : ''}`} />
+              ))}
+            </div>
+          )}
+
+          {/* Submit */}
+          <button
+            type="submit"
+            className={`login-btn${submitting ? ' login-btn--loading' : ''}`}
+            disabled={locked || submitting}
+            aria-busy={submitting}
+          >
+            {submitting ? (
+              <span className="login-spinner" aria-hidden="true" />
+            ) : locked ? (
+              `Locked (${lockoutLeft}s)`
+            ) : (
+              'Sign In'
+            )}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+const LOADER_PHASES = [
+  'Authenticating session...',
+  'Loading OCR engine...',
+  'Initializing workspace...',
+  'Almost ready...',
+];
+
+function AppLoader({ logo }) {
+  const [phase, setPhase] = useState(0);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setPhase(p => (p + 1 < LOADER_PHASES.length ? p + 1 : p));
+    }, 600);
+    return () => clearInterval(interval);
+  }, []);
+
+  return (
+    <div className="loader-screen">
+      <div className="loader-content">
+        <div className="loader-ring">
+          <div className="logo-circle loader-logo">
+            <img src={logo} alt="Kagzso" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+          </div>
+        </div>
+        <h1 className="logo-text" style={{ fontSize: '32px', marginTop: '24px', marginBottom: '6px' }}>
+          Kagzso
+        </h1>
+        <p className="loader-phase">{LOADER_PHASES[phase]}</p>
+        <div className="loader-bar-track" style={{ marginTop: '28px' }}>
+          <div className="loader-bar-fill" />
+        </div>
+        <div className="loader-dots">
+          {LOADER_PHASES.map((_, i) => (
+            <span key={i} className={`loader-dot${i <= phase ? ' loader-dot--active' : ''}`} />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function App() {
+  const [isLoggedIn, setIsLoggedIn] = useState(() => sessionStorage.getItem('kagzso_auth') === '1');
+  const [isLoading, setIsLoading] = useState(false);
   const [files, setFiles] = useState([]);
   const [processing, setProcessing] = useState(false);
   const [results, setResults] = useState([]);
@@ -178,20 +399,50 @@ function App() {
     },
   ];
 
+  if (!isLoggedIn) {
+    return <Login onLogin={() => {
+      setIsLoading(true);
+      setTimeout(() => { setIsLoading(false); setIsLoggedIn(true); }, 2400);
+    }} />;
+  }
+
+  if (isLoading) {
+    return <AppLoader logo={logo} />;
+  }
+
   return (
-    <div className="container">
+    <div className="container" style={{ position: 'relative' }}>
+      <div style={{ position: 'absolute', top: '20px', right: '20px', zIndex: 10 }}>
+        <button
+          onClick={() => { sessionStorage.removeItem('kagzso_auth'); setIsLoggedIn(false); }}
+          className="btn-secondary"
+          style={{ width: 'auto', padding: '8px 16px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px', borderRadius: '10px' }}
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+            <polyline points="16 17 21 12 16 7"/>
+            <line x1="21" y1="12" x2="9" y2="12"/>
+          </svg>
+          Sign Out
+        </button>
+      </div>
+
       <div className="brand-section">
-        <div className="logo-circle">
-          <img src={logo} alt="Kagzso Logo" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+        <div className="brand-row">
+          <div className="logo-circle" style={{ width: '48px', height: '48px', flexShrink: 0 }}>
+            <img src={logo} alt="Kagzso Logo" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+          </div>
+          <div className="brand-text">
+            <h1 className="logo-text" style={{ marginBottom: '2px' }}>Kagzso</h1>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <div style={{ width: '7px', height: '7px', borderRadius: '50%', background: serverStatus === 'online' ? '#10b981' : serverStatus === 'offline' ? '#ef4444' : '#94a3b8', boxShadow: serverStatus === 'online' ? '0 0 8px #10b981' : 'none', flexShrink: 0 }}></div>
+              <span style={{ fontSize: '10px', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '1px' }}>
+                System {serverStatus}
+              </span>
+            </div>
+          </div>
         </div>
-        <h1 className="logo-text">Kagzso</h1>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', marginBottom: '8px' }}>
-          <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: serverStatus === 'online' ? '#10b981' : serverStatus === 'offline' ? '#ef4444' : '#94a3b8', boxShadow: serverStatus === 'online' ? '0 0 10px #10b981' : 'none' }}></div>
-          <span style={{ fontSize: '10px', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '1px' }}>
-            System {serverStatus}
-          </span>
-        </div>
-        <p className="subtitle">AUTOMATED BATCH DOCUMENT ANALYZER</p>
+        <p className="subtitle" style={{ marginTop: '12px' }}>AUTOMATED BATCH DOCUMENT ANALYZER</p>
       </div>
 
       {/* Hidden file inputs */}
@@ -391,6 +642,7 @@ function App() {
       <div style={{ textAlign: 'center', padding: '24px 0 8px', color: 'var(--text-secondary)', fontSize: '12px', letterSpacing: '0.5px' }}>
         Supports: Aadhaar · PAN · Passport · Driving License · Voter ID
       </div>
+
     </div>
   );
 }

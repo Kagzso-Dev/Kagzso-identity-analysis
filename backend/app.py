@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).parent
-load_dotenv()
+load_dotenv(BASE_DIR.parent / ".env")
 
 app = FastAPI(title="Kagzso Identity API")
 
@@ -54,31 +54,32 @@ else:  # Linux (Render)
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 ID_PROMPT = """
-You are an intelligent Indian document data extractor specialized in KYC documents (Aadhaar, PAN, Voter ID, Passport, DL).
+You are an expert Indian KYC document extractor. OCR text from scanned identity cards is often noisy with missing spaces, garbled characters, or mixed Hindi/English words.
 
-Task:
-Analyze the OCR text provided and extract information into a structured JSON format.
+Task: Analyze the OCR text and extract fields into a structured JSON object.
 
 Detection Rules:
-- Identify "type" as: "AADHAAR", "PAN CARD", "VOTER ID", "DRIVING LICENSE", "PASSPORT", or "UNKNOWN".
-- Aadhaar: 12-digit number (xxxx xxxx xxxx).
-- PAN: 10-char alphanumeric (e.g., ABCDE1234F).
-- Voter ID: EPIC number.
-- DL: License number.
+- Set "type" to one of: "AADHAAR", "PAN CARD", "VOTER ID", "DRIVING LICENSE", "PASSPORT", or "UNKNOWN".
+- AADHAAR: look for keywords like "Aadhaar", "UIDAI", "Unique Identification", "आधार", or a 12-digit number in groups (xxxx xxxx xxxx). Even partial matches or noisy OCR variants count.
+- PAN CARD: look for "Income Tax", "Permanent Account Number", or a 10-char pattern like ABCDE1234F.
+- VOTER ID: look for "Election Commission", "EPIC", "Voter".
+- DRIVING LICENSE: look for "Driving Licence", "Transport", "DL No".
+- PASSPORT: look for "Republic of India", "Passport No", "Nationality".
+- Be lenient — OCR text may be garbled. Infer type from any recognizable keywords or number patterns.
 
 Field Mapping:
-- name: Full name of the person.
-- father_name: Father's or Spouse's name.
-- id_number: The primary ID number.
-- dob: Date of birth (DD-MM-YYYY or DD/MM/YYYY).
-- location: Full address or state/city.
+- name: Full name of the cardholder (not father's name).
+- father_name: Father's name (prefixed by "S/O", "D/O", "C/O", "Father") or spouse name.
+- id_number: The primary ID number (12-digit Aadhaar, 10-char PAN, etc.).
+- dob: Date of birth in DD-MM-YYYY or DD/MM/YYYY format.
+- location: Full address, state, or city found in the document.
 
-Return ONLY a JSON object. No markdown, no intro.
-If a field is missing, set it to "-".
+Return ONLY a valid JSON object. No markdown, no explanation.
+If a field cannot be determined, set it to "-".
 
 JSON Structure:
 {{
-  "type": "-",
+  "type": "AADHAAR",
   "name": "-",
   "father_name": "-",
   "id_number": "-",
@@ -91,21 +92,24 @@ OCR TEXT:
 """
 
 def preprocess_image(contents: bytes) -> np.ndarray:
-    """Apply grayscale and thresholding for better OCR results."""
+    """Apply grayscale, upscaling, and adaptive thresholding for better OCR results."""
     nparr = np.frombuffer(contents, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None:
         return None
-    
+
     # 1. Grayscale
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
-    # 2. Rescaling (Optional but helps)
-    # gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    
-    # 3. Thresholding (Binary + Otsu)
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    
+
+    # 2. Upscale 2x — significantly improves OCR on small/compressed images
+    gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+
+    # 3. Adaptive thresholding — handles varied lighting and colored backgrounds
+    #    better than Otsu's global threshold (which destroys colored ID cards)
+    thresh = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 2
+    )
+
     return thresh
 
 def clean_ocr_text(text: str) -> str:
@@ -119,12 +123,13 @@ def clean_ocr_text(text: str) -> str:
 
 def regex_extract_aadhaar(text: str):
     """Fallback/Booster regex for Aadhaar documents."""
-    aadhaar_pattern = r'\d{4}\s\d{4}\s\d{4}'
-    dob_pattern = r'\d{2}/\d{2}/\d{4}'
-    
+    # Allow any whitespace or dash between groups (OCR often misreads spacing)
+    aadhaar_pattern = r'\d{4}[\s\-]\d{4}[\s\-]\d{4}'
+    dob_pattern = r'\d{2}[\/\-]\d{2}[\/\-]\d{4}'
+
     number = re.search(aadhaar_pattern, text)
     dob = re.search(dob_pattern, text)
-    
+
     return {
         "id_number": number.group(0) if number else None,
         "dob": dob.group(0) if dob else None
@@ -167,8 +172,16 @@ async def upload_file(file: UploadFile = File(...)):
             processed_img = preprocess_image(contents)
             if processed_img is None:
                 raise ValueError("Could not decode image.")
-            # Use specific config as requested
+            # Try PSM 6 (uniform block) first, fall back to PSM 11 (sparse text)
             raw_text = pytesseract.image_to_string(processed_img, config='--oem 3 --psm 6')
+            if len(raw_text.strip()) < 40:
+                raw_text = pytesseract.image_to_string(processed_img, config='--oem 3 --psm 11')
+            # Last resort: try on the original (non-preprocessed) image
+            if len(raw_text.strip()) < 40:
+                nparr = np.frombuffer(contents, np.uint8)
+                orig_img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+                if orig_img is not None:
+                    raw_text = pytesseract.image_to_string(orig_img, config='--oem 3 --psm 6')
 
         raw_text = clean_ocr_text(raw_text)
         logger.info(f"Extracted OCR Text snippet:\n{raw_text[:500]}")
