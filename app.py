@@ -1,6 +1,6 @@
-# This file exists to proxy the FastAPI app from the backend subfolder
-# This allows 'gunicorn app:app' to work from the project root
-from backend.app import app
+# This file proxies the FastAPI app and adds WSGI compatibility for standard Gunicorn workers
+from a2wsgi import ASGIMiddleware
+from backend.app import app as asgi_app
 
-# This ensures that even if Gunicorn defaults to a sync worker, 
-# it still has access to the FastAPI app object.
+# The 'app' object here is now a standard WSGI app that Gunicorn understands natively
+app = ASGIMiddleware(asgi_app)

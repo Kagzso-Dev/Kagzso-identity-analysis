@@ -11,3 +11,4 @@ openpyxl
 opencv-python-headless
 pymupdf
 numpy
+a2wsgi
