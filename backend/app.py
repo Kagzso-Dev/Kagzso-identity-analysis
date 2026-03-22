@@ -34,8 +34,11 @@ origins = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
+    # Vercel preview deployments get a unique hash in the subdomain, e.g.
+    # kagzso-identity-analysis-abc123-user.vercel.app — cover them all with regex
+    allow_origin_regex=r"https://kagzso-identity-analysis[a-zA-Z0-9\-]*\.vercel\.app",
     allow_credentials=False,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -409,6 +412,11 @@ def empty_response(filename: str, reason: str) -> dict:
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
+@app.options("/{rest:path}")
+async def preflight_handler():
+    """Explicit OPTIONS handler so CORS preflight always gets 200."""
+    return {}
 
 @app.get("/")
 async def root():
