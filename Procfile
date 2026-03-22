@@ -1,2 +1,2 @@
-# This Procfile is for Render to find the python entry point correctly
-web: uvicorn backend.app:app --host 0.0.0.0 --port $PORT
+# Use Gunicorn with Uvicorn workers for production stability on Render
+web: gunicorn -w 1 -k uvicorn.workers.UvicornWorker backend.app:app --bind 0.0.0.0:$PORT
