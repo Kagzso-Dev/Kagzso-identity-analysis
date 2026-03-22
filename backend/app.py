@@ -59,10 +59,10 @@ except Exception as e:
 
 # Target longest side for Vision API (keeps payload fast and under limits)
 VISION_MAX_DIM = 1600
-# Target shortest side for Tesseract (300 DPI equivalent for a credit-card doc)
-TESSERACT_MIN_SHORT = 900
+# Target shortest side for OCR (300 DPI equivalent for a credit-card doc)
+OCR_MIN_SHORT = 900
 # Hard cap on upscale factor to avoid OOM on huge originals
-TESSERACT_MAX_SCALE = 4.0
+OCR_MAX_SCALE = 4.0
 
 
 def normalise_for_vision(contents: bytes) -> tuple[bytes, str]:
@@ -99,10 +99,10 @@ def normalise_for_vision(contents: bytes) -> tuple[bytes, str]:
         return contents, "image/jpeg"
 
 
-def normalise_for_tesseract(contents: bytes) -> bytes:
+def normalise_for_ocr(contents: bytes) -> bytes:
     """
-    Upscale small images so the shortest side reaches TESSERACT_MIN_SHORT pixels.
-    Large images are left unchanged (Tesseract handles them fine natively).
+    Upscale small images so the shortest side reaches OCR_MIN_SHORT pixels.
+    Large images are left unchanged (OCR handles them fine natively).
     Returns PNG bytes for lossless OCR input.
     """
     try:
@@ -112,11 +112,11 @@ def normalise_for_tesseract(contents: bytes) -> bytes:
 
         w, h = img.size
         shortest = min(w, h)
-        if shortest < TESSERACT_MIN_SHORT:
-            scale = min(TESSERACT_MIN_SHORT / shortest, TESSERACT_MAX_SCALE)
+        if shortest < OCR_MIN_SHORT:
+            scale = min(OCR_MIN_SHORT / shortest, OCR_MAX_SCALE)
             new_w, new_h = int(w * scale), int(h * scale)
             img = img.resize((new_w, new_h), Image.LANCZOS)
-            logger.info(f"Tesseract upscale: {w}x{h} → {new_w}x{new_h} (×{scale:.2f})")
+            logger.info(f"OCR upscale: {w}x{h} → {new_w}x{new_h} (×{scale:.2f})")
 
         buf = io.BytesIO()
         img.save(buf, format="PNG")
@@ -130,22 +130,46 @@ def normalise_for_tesseract(contents: bytes) -> bytes:
 # Prompts
 # ---------------------------------------------------------------------------
 
-VISION_PROMPT = """You are an expert at reading Indian identity documents.
+VISION_PROMPT = """You are an expert OCR system specialised in Indian government identity documents.
 
-Look at this document image and extract the following fields into a JSON object:
-- type: one of "AADHAAR", "PAN CARD", "VOTER ID", "DRIVING LICENSE", "PASSPORT", "UNKNOWN"
-- name: full name of the cardholder (not father's name)
-- father_name: father or spouse name (look for S/O, D/O, C/O, W/O prefixes)
-- id_number: the primary ID number (Aadhaar: 12 digits like "1234 5678 9012", PAN: "ABCDE1234F", etc.)
-- dob: date of birth as DD/MM/YYYY or DD-MM-YYYY
-- location: full address, city, or state on the document
+Carefully examine every part of the image — including small print, watermarks, and partially visible text.
 
-Rules:
-- Be lenient with low quality or partially visible text
-- Set any field you cannot read to "-"
-- Return ONLY a valid JSON object — no markdown, no explanation
+Identify the document type:
+- AADHAAR: has "Aadhaar", "UIDAI", "Unique Identification Authority", "आधार", or a 12-digit number split as XXXX XXXX XXXX
+- PAN CARD: has "Income Tax Department", "Permanent Account Number", or a 10-char code like ABCDE1234F
+- VOTER ID: has "Election Commission of India", "EPIC No", or "Voter"
+- DRIVING LICENSE: has "Driving Licence", "Transport Authority", or "DL No"
+- PASSPORT: has "Republic of India", "Passport No", or travel document layout
 
-Example: {"type":"AADHAAR","name":"Rahul Sharma","father_name":"Suresh Sharma","id_number":"1234 5678 9012","dob":"15/08/1990","location":"Mumbai, Maharashtra"}"""
+Extract these fields into a single JSON object:
+- type: document type from the list above, or "UNKNOWN"
+- name: full name of the primary cardholder (NOT the father/spouse)
+- father_name: name after S/O, D/O, C/O, or W/O prefix; "-" if not present
+- id_number: the main identification number exactly as printed
+- dob: date of birth in DD/MM/YYYY or DD-MM-YYYY format
+- location: full address, district, state, or pincode visible on the document
+
+Important rules:
+- Read ALL text visible in the image, even if blurry or at an angle
+- Aadhaar numbers: look for any 12-digit sequence, possibly split across lines
+- For PAN: the 10-char alphanumeric code (e.g. ABCDE1234F)
+- Set fields you genuinely cannot read to "-" — never guess
+- Output ONLY the raw JSON object. No markdown, no code block, no explanation.
+
+Example output:
+{"type":"AADHAAR","name":"Priya Mehta","father_name":"Ramesh Mehta","id_number":"2345 6789 0123","dob":"04/03/1995","location":"12 MG Road, Pune, Maharashtra 411001"}"""
+
+VISION_RETRY_PROMPT = """This is an Indian government identity document. I need you to read every number and word visible.
+
+Focus on:
+1. Any 12-digit number (could be Aadhaar): look for groups like XXXX XXXX XXXX
+2. Any 10-character alphanumeric code (could be PAN): like ABCDE1234F
+3. A person's name (usually the largest text after any heading)
+4. A date in DD/MM/YYYY format (date of birth)
+5. Any address text
+
+Return ONLY this JSON (fill in what you can see, use "-" for anything not visible):
+{"type":"AADHAAR","name":"-","father_name":"-","id_number":"-","dob":"-","location":"-"}"""
 
 OCR_LLM_PROMPT = """You are an expert Indian KYC document extractor. OCR text is often noisy with garbled characters or mixed Hindi/English.
 
@@ -182,8 +206,41 @@ VISION_MODELS = [
 ]
 
 
+def _call_vision_model(model: str, b64: str, mime: str, prompt: str) -> dict | None:
+    """Call one Vision model with the given prompt. Returns parsed dict or None."""
+    completion = client.chat.completions.create(
+        model=model,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                {"type": "text", "text": prompt},
+            ],
+        }],
+        temperature=0,
+        max_tokens=600,
+    )
+    raw = completion.choices[0].message.content.strip()
+    logger.info(f"Vision ({model}) raw: {raw[:500]}")
+    match = re.search(r'\{.*\}', raw, re.DOTALL)
+    if match:
+        return json.loads(match.group(0))
+    return None
+
+
+def _has_useful_fields(data: dict) -> bool:
+    """Return True if at least one real field was extracted (not just type)."""
+    return any(
+        data.get(f, "-") not in ("-", "", None, "UNKNOWN")
+        for f in ("name", "id_number", "dob", "location", "father_name")
+    )
+
+
 def extract_with_vision(contents: bytes) -> dict | None:
-    """Normalise image to optimal size then try each Vision model in sequence."""
+    """
+    Normalise image → try each Vision model with the full prompt.
+    If result is UNKNOWN or has no useful fields, retry with the focused retry prompt.
+    """
     if client is None or not _groq_api_key:
         logger.warning("Vision skipped: Groq client not ready or API key missing.")
         return None
@@ -191,126 +248,98 @@ def extract_with_vision(contents: bytes) -> dict | None:
     vision_bytes, mime = normalise_for_vision(contents)
     b64 = base64.b64encode(vision_bytes).decode("utf-8")
 
+    best: dict | None = None
+
     for model in VISION_MODELS:
+        # Pass 1 — full detailed prompt
         try:
-            logger.info(f"Trying vision model: {model}")
-            completion = client.chat.completions.create(
-                model=model,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
-                        {"type": "text", "text": VISION_PROMPT},
-                    ],
-                }],
-                temperature=0,
-                max_tokens=512,
-            )
-
-            raw = completion.choices[0].message.content.strip()
-            logger.info(f"Vision ({model}) response: {raw[:400]}")
-
-            match = re.search(r'\{.*\}', raw, re.DOTALL)
-            if match:
-                data = json.loads(match.group(0))
-                logger.info(f"Vision result ({model}): {data}")
-                return data
-
-            logger.warning(f"Vision model {model} returned no JSON.")
-
+            logger.info(f"Vision pass 1 — model: {model}")
+            data = _call_vision_model(model, b64, mime, VISION_PROMPT)
+            if data:
+                logger.info(f"Vision pass 1 result ({model}): {data}")
+                if data.get("type") != "UNKNOWN" or _has_useful_fields(data):
+                    return data          # good result — stop here
+                best = data             # keep as candidate, try retry pass
         except Exception as e:
-            logger.error(f"Vision model {model} failed: {e}")
+            logger.error(f"Vision pass 1 ({model}) failed: {e}")
 
-    logger.error("All vision models failed.")
-    return None
+        # Pass 2 — focused retry prompt when pass 1 returned UNKNOWN
+        try:
+            logger.info(f"Vision pass 2 (retry) — model: {model}")
+            data2 = _call_vision_model(model, b64, mime, VISION_RETRY_PROMPT)
+            if data2 and _has_useful_fields(data2):
+                logger.info(f"Vision pass 2 result ({model}): {data2}")
+                return data2
+        except Exception as e:
+            logger.error(f"Vision pass 2 ({model}) failed: {e}")
 
-# ---------------------------------------------------------------------------
-# Tesseract OCR — FALLBACK
-# ---------------------------------------------------------------------------
+    logger.error("All vision model passes failed or returned no useful data.")
+    return best  # return best attempt (even if UNKNOWN) so regex_boost can try
 
-def tesseract_available() -> bool:
-    try:
-        import pytesseract
-        pytesseract.get_tesseract_version()
-        return True
-    except Exception:
-        return False
+# ----------------------------------------------------------
+# EasyOCR — Portability fallback (replaces Tesseract)
+# ----------------------------------------------------------
+
+_reader = None
+
+def get_easyocr_reader():
+    """Lazy initialization of EasyOCR reader to save RAM on startup."""
+    global _reader
+    if _reader is None:
+        try:
+            import easyocr
+            # Load English and Hindi (best for Indian IDs)
+            # Use gpu=False for standard Render CPU instances
+            _reader = easyocr.Reader(['en', 'hi'], gpu=False)
+            logger.info("EasyOCR Reader initialized (en/hi).")
+        except Exception as e:
+            logger.error(f"Failed to initialize EasyOCR: {e}")
+    return _reader
 
 
-def preprocess_image_variants(img_bytes: bytes) -> list:
+def ocr_available() -> bool:
+    """Check if EasyOCR is ready to use."""
+    return get_easyocr_reader() is not None
+
+
+def run_easy_ocr(contents: bytes) -> str:
     """
-    Build multiple OpenCV preprocessed variants from already-normalised image bytes.
-    The input should already be at the right resolution (normalise_for_tesseract first).
+    1. Convert bytes → NumPy/OpenCV image
+    2. Run EasyOCR on the image array
+    3. Return joined string of all detected text
     """
-    try:
-        import cv2
-        import numpy as np
-    except ImportError:
-        return []
+    import numpy as np
+    import cv2
 
-    nparr = np.frombuffer(img_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
-        return []
-
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    variants = []
-
-    # Adaptive threshold — block=11 is best for fine ID-card text
-    thresh_adapt = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-    )
-    variants.append(thresh_adapt)
-
-    # OTSU — works well under even lighting
-    _, thresh_otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    variants.append(thresh_otsu)
-
-    # Denoised + adaptive — reduces JPEG compression artifacts
-    denoised = cv2.fastNlMeansDenoising(gray, h=10)
-    thresh_denoised = cv2.adaptiveThreshold(
-        denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-    )
-    variants.append(thresh_denoised)
-
-    # Plain grayscale — sometimes cleaner than thresholded
-    variants.append(gray)
-
-    return variants
-
-
-def run_tesseract_ocr(contents: bytes) -> str:
-    """Normalise image size then run Tesseract across all variants + PSM modes."""
-    import pytesseract
-
-    if os.name == "nt":
-        pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-    else:
-        pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
-
-    # Upscale small images to give Tesseract enough resolution
-    normalised = normalise_for_tesseract(contents)
-    variants = preprocess_image_variants(normalised)
-    if not variants:
-        logger.error("Could not generate image variants for Tesseract.")
+    reader = get_easyocr_reader()
+    if not reader:
         return ""
 
-    psm_modes = ["--oem 3 --psm 4", "--oem 3 --psm 6", "--oem 3 --psm 3", "--oem 3 --psm 11"]
-    best = ""
+    try:
+        # Convert bytes to cv2 image array
+        nparr = np.frombuffer(contents, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            logger.error("EasyOCR: Could not decode image bytes with OpenCV.")
+            return ""
 
-    for i, img in enumerate(variants):
-        for psm in psm_modes:
-            try:
-                candidate = pytesseract.image_to_string(img, config=psm)
-                if len(candidate.strip()) > len(best.strip()):
-                    best = candidate
-                    logger.info(f"Tesseract improved: variant={i} psm={psm} chars={len(best.strip())}")
-            except Exception as e:
-                logger.warning(f"Tesseract failed (variant={i}, {psm}): {e}")
-        if len(best.strip()) >= 60:
-            break
+        # Pre-process for OCR (Grayscale)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    return best
+        # Basic OCR
+        results = reader.readtext(gray, detail=0)
+        full_text = " ".join(results)
+
+        logger.info(f"EasyOCR success: {len(full_text)} chars extracted.")
+        logger.debug(f"FULL OCR TEXT: {full_text}")
+        return full_text
+
+    except Exception as e:
+        logger.error(f"EasyOCR failed: {e}")
+        return ""
+
+
+# Preprocessing and running Tesseract is removed in favor of EasyOCR's native handling
 
 
 def llm_from_ocr_text(raw_text: str) -> dict | None:
@@ -334,9 +363,17 @@ def llm_from_ocr_text(raw_text: str) -> dict | None:
 # PDF extraction — native text layer + Tesseract for scanned pages
 # ---------------------------------------------------------------------------
 
+def pdf_page_to_image(contents: bytes, page_num: int = 0, scale: float = 2.0) -> bytes:
+    """Render a PDF page to PNG bytes using PyMuPDF."""
+    import fitz
+    doc = fitz.open(stream=contents, filetype="pdf")
+    page = doc[page_num]
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale))
+    return pix.tobytes("png")
+
+
 def extract_pdf_text(contents: bytes) -> str:
     import fitz
-
     doc = fitz.open(stream=contents, filetype="pdf")
     full_text = ""
 
@@ -346,27 +383,12 @@ def extract_pdf_text(contents: bytes) -> str:
             logger.info(f"PDF page {page_num}: {len(text)} chars (native text layer).")
             full_text += text + "\n"
         else:
-            logger.warning(f"PDF page {page_num}: no native text — trying Tesseract.")
-            if tesseract_available():
-                try:
-                    import pytesseract
-                    pytesseract.pytesseract.tesseract_cmd = (
-                        r"C:\Program Files\Tesseract-OCR\tesseract.exe" if os.name == "nt"
-                        else "/usr/bin/tesseract"
-                    )
-                    # Render at 2x then normalise
-                    mat = fitz.Matrix(2.0, 2.0)
-                    pix = page.get_pixmap(matrix=mat)
-                    img_bytes = normalise_for_tesseract(pix.tobytes("png"))
-                    variants = preprocess_image_variants(img_bytes)
-                    if variants:
-                        ocr_text = pytesseract.image_to_string(variants[0], config="--oem 3 --psm 6")
-                        full_text += ocr_text + "\n"
-                        logger.info(f"PDF page {page_num}: Tesseract got {len(ocr_text)} chars.")
-                except Exception as e:
-                    logger.warning(f"PDF Tesseract failed on page {page_num}: {e}")
-            else:
-                logger.warning(f"PDF page {page_num} is scanned but Tesseract is not available.")
+            logger.warning(f"PDF page {page_num}: no native text — trying EasyOCR.")
+            mat = fitz.Matrix(2.0, 2.0)
+            pix = page.get_pixmap(matrix=mat)
+            img_bytes = pix.tobytes("png")
+            page_text = run_easy_ocr(img_bytes)
+            full_text += page_text + "\n"
 
     return full_text.strip()
 
@@ -382,20 +404,45 @@ def clean_ocr_text(text: str) -> str:
 
 
 def regex_boost(data: dict, raw_text: str) -> dict:
-    aadhaar_re = r'\d{4}[\s\-]\d{4}[\s\-]\d{4}'
-    dob_re = r'\d{2}[\/\-]\d{2}[\/\-]\d{4}'
+    # Basic normalization
+    text_clean = re.sub(r'[^a-zA-Z0-9\s\-\/]', ' ', raw_text)
+    doc_type = data.get("type", "UNKNOWN")
 
-    if data.get("id_number", "-") == "-":
-        m = re.search(aadhaar_re, raw_text)
+    # 1. Aadhaar Number (12 digits)
+    aadhaar_pat = r'\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b'
+    # 2. PAN (ABCDE1234F)
+    pan_pat = r'\b[A-Z]{5}\d{4}[A-Z]\b'
+    # 3. DOB (DD/MM/YYYY or DD-MM-YYYY)
+    dob_pat = r'\b\d{2}[\s\/\-]\d{2}[\s\/\-]\d{4}\b'
+
+    if data.get("id_number", "-") in ("-", "", None):
+        m = re.search(aadhaar_pat, text_clean)
         if m:
             data["id_number"] = m.group(0)
-            logger.info(f"Regex boosted id_number: {data['id_number']}")
+            if doc_type == "UNKNOWN": data["type"] = "AADHAAR"
+            logger.info(f"Regex Boost: Found Aadhaar ID: {data['id_number']}")
+        else:
+            m = re.search(pan_pat, text_clean)
+            if m:
+                data["id_number"] = m.group(0)
+                if doc_type == "UNKNOWN": data["type"] = "PAN CARD"
+                logger.info(f"Regex Boost: Found PAN ID: {data['id_number']}")
 
-    if data.get("dob", "-") == "-":
-        m = re.search(dob_re, raw_text)
+    if data.get("dob", "-") in ("-", "", None):
+        m = re.search(dob_pat, text_clean)
         if m:
-            data["dob"] = m.group(0)
-            logger.info(f"Regex boosted dob: {data['dob']}")
+            data["dob"] = m.group(0).replace(" ", "/")
+            logger.info(f"Regex Boost: Found DOB: {data['dob']}")
+
+    if data.get("name", "-") in ("-", "", None):
+        # Fallback Name Search: Capitalized blocks that aren't headers
+        name_m = re.search(r'\b([A-Z]{3,}\s+[A-Z]{3,}(?:\s+[A-Z]{3,})?)\b', raw_text)
+        if name_m:
+            candidate = name_m.group(1).strip()
+            # Simple header blacklist
+            if not any(x in candidate for x in ["INDIA", "GOVERNMENT", "INCOME", "TAX", "CARD", "IDENTIFICATION"]):
+                data["name"] = candidate
+                logger.info(f"Regex Boost: Found Potential Name: {data['name']}")
 
     return data
 
@@ -428,12 +475,10 @@ async def health():
     return {
         "status": "ok",
         "message": "healthy",
-        "tesseract_available": tesseract_available(),
+        "ocr_available": ocr_available(),
         "groq_client_initialized": client is not None,
         "groq_api_key_set": bool(_groq_api_key),
         "vision_models": VISION_MODELS,
-        "vision_max_dim": VISION_MAX_DIM,
-        "tesseract_min_short": TESSERACT_MIN_SHORT,
     }
 
 
@@ -457,61 +502,66 @@ async def upload_file(file: UploadFile = File(...)):
     try:
         data = None
 
-        # ── PDF ──────────────────────────────────────────────────────────────
+        # ── STEP 1: Groq Vision API — PRIMARY for ALL document types ─────────
         if file.content_type == "application/pdf":
-            raw_text = clean_ocr_text(extract_pdf_text(contents))
-            logger.info(f"PDF text ({len(raw_text)} chars):\n{raw_text[:500]}")
-
-            if not raw_text.strip():
-                return empty_response(
-                    file.filename,
-                    "Could not extract text from PDF. It may be fully scanned and Tesseract is unavailable."
-                )
-            data = llm_from_ocr_text(raw_text)
-
-        # ── IMAGE ─────────────────────────────────────────────────────────────
+            logger.info("PDF: trying Groq Vision on page 1 first.")
+            try:
+                page_img = pdf_page_to_image(contents, page_num=0)
+                data = extract_with_vision(page_img)
+                if data and data.get("type") != "UNKNOWN":
+                    logger.info("PDF: Groq Vision succeeded.")
+                else:
+                    logger.info("PDF: Groq Vision returned UNKNOWN — will try text fallback.")
+                    data = None
+            except Exception as e:
+                logger.warning(f"PDF: Groq Vision step failed ({e}) — falling back to text.")
+                data = None
         else:
-            # Step 1: Groq Vision (primary — works on Render without Tesseract)
+            # Image — Vision is always tried first
             data = extract_with_vision(contents)
 
-            # Step 2: Tesseract + LLM (available locally and on Render after buildCommand fix)
-            if data is None or data.get("type") == "UNKNOWN":
-                logger.info("Vision returned UNKNOWN/None — trying Tesseract fallback.")
-                if tesseract_available():
-                    raw_text = clean_ocr_text(run_tesseract_ocr(contents))
-                    logger.info(f"Tesseract OCR ({len(raw_text)} chars):\n{raw_text[:500]}")
-                    if raw_text.strip():
-                        fallback = llm_from_ocr_text(raw_text)
-                        if fallback:
-                            has_data = any(
-                                fallback.get(f, "-") not in ("-", "", None)
-                                for f in ("name", "id_number", "dob", "location")
-                            )
-                            if has_data or data is None:
-                                data = fallback
-                                logger.info("Using Tesseract+LLM result.")
+        # ── STEP 2: Text-layer + Groq LLM — for PDFs when Vision failed ──────
+        if data is None and file.content_type == "application/pdf":
+            logger.info("PDF: falling back to native text layer → Groq LLM.")
+            raw_text = clean_ocr_text(extract_pdf_text(contents))
+            logger.info(f"PDF text ({len(raw_text)} chars):\n{raw_text[:500]}")
+            if raw_text.strip():
+                data = llm_from_ocr_text(raw_text)
+
+        # ── STEP 3: EasyOCR + Groq LLM — last resort for images ────────────
+        if data is None or data.get("type") == "UNKNOWN":
+            if file.content_type != "application/pdf":
+                logger.info("Vision returned UNKNOWN/None — trying EasyOCR fallback.")
+                raw_text = run_easy_ocr(contents)
+                if raw_text.strip():
+                    logger.info(f"EasyOCR Full Text: {raw_text}")
+                    fallback = llm_from_ocr_text(raw_text)
+                    if fallback:
+                        has_data = any(
+                            fallback.get(f, "-") not in ("-", "", None)
+                            for f in ("name", "id_number", "dob", "location")
+                        )
+                        if has_data or data is None:
+                            data = fallback
+                            logger.info("Using EasyOCR+LLM result.")
                 else:
-                    logger.warning("Tesseract not available — Vision is the only extraction path.")
+                    logger.warning("EasyOCR extracted no text.")
 
         if not data:
-            tess = tesseract_available()
             return empty_response(
                 file.filename,
-                f"All extraction methods failed "
-                f"[groq_key={'SET' if _groq_api_key else 'MISSING'}, "
-                f"tesseract={'ok' if tess else 'not installed'}]. "
+                f"All extraction methods failed [OCR Available: {ocr_available()}]. "
                 f"Try a clearer image or check Render logs."
             )
 
         # Normalise keys for frontend
-        data["document_type"] = data.get("type", "UNKNOWN")
         data["address"] = data.get("location", "-")
         data["filename"] = file.filename
 
-        # Regex boost: recover Aadhaar number / DOB if model missed them
-        if data.get("type") in ("AADHAAR", "UNKNOWN"):
-            combined = " ".join(str(v) for v in data.values())
-            data = regex_boost(data, combined)
+        # Regex boost: always run — recovers any missed numbers/dates/names
+        combined = " ".join(str(v) for v in data.values())
+        data = regex_boost(data, combined)
+        data["document_type"] = data.get("type", "UNKNOWN")
 
         logger.info(f"Final response: {data}")
         session_history.append(data)
