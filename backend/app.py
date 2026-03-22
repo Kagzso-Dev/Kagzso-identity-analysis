@@ -31,6 +31,7 @@ session_history = []
 
 # CORS Configuration
 origins = [
+    "https://kagzso-identity-analysis.vercel.app",
     "https://kagzso-identity.netlify.app",
     "http://localhost:5173",
     "http://localhost:3000",
@@ -150,7 +151,11 @@ def extract_text_from_pdf(contents: bytes) -> str:
 @app.get("/")
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "tesseract": pytesseract.pytesseract.tesseract_cmd}
+    return {
+        "status": "ok", 
+        "tesseract": pytesseract.pytesseract.tesseract_cmd,
+        "message": "System is running normally"
+    }
 
 @app.post("/scan")
 @app.post("/upload")
@@ -246,6 +251,7 @@ async def export_excel():
     return FileResponse(file_path, filename="Kagzso_Extraction.xlsx")
 
 @app.delete("/clear")
+@app.delete("/api/clear")
 async def clear():
     global session_history
     session_history = []
@@ -253,6 +259,6 @@ async def clear():
 
 if __name__ == "__main__":
     import uvicorn
-    # Render uses the PORT environment variable
-    port = int(os.environ.get("PORT", 8000))
+    # Render uses the PORT environment variable, defaults to 10000 for Render
+    port = int(os.environ.get("PORT", 10000))
     uvicorn.run(app, host="0.0.0.0", port=port)
