@@ -323,15 +323,12 @@ def run_easy_ocr(contents: bytes) -> str:
             logger.error("EasyOCR: Could not decode image bytes with OpenCV.")
             return ""
 
-        # Pre-process for OCR (Grayscale)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-        # Basic OCR
-        results = reader.readtext(gray, detail=0)
+        # Basic OCR — processing internal to EasyOCR (handles normalisation well)
+        results = reader.readtext(img, detail=0)
         full_text = " ".join(results)
 
-        logger.info(f"EasyOCR success: {len(full_text)} chars extracted.")
-        logger.debug(f"FULL OCR TEXT: {full_text}")
+        # Log at INFO level so the user can see it in Render logs
+        logger.info(f"--- EASYOCR EXTRACTED TEXT ---\n{full_text}\n--- END OCR ---")
         return full_text
 
     except Exception as e:
@@ -404,45 +401,67 @@ def clean_ocr_text(text: str) -> str:
 
 
 def regex_boost(data: dict, raw_text: str) -> dict:
-    # Basic normalization
+    """Aggressive field recovery using regex and fuzzy keyword matching."""
+    # Basic normalization — keep punctuation that might be part of dates/IDs
     text_clean = re.sub(r'[^a-zA-Z0-9\s\-\/]', ' ', raw_text)
     doc_type = data.get("type", "UNKNOWN")
 
-    # 1. Aadhaar Number (12 digits)
+    # 1. Aggressive Type Detection (Aadhaar / PAN keywords)
+    if doc_type == "UNKNOWN":
+        aadhaar_keywords = ["authority", "india", "unique", "identification", "aadhaar", "आधार", "male", "female"]
+        pan_keywords = ["income", "tax", "permanent", "account", "department", "pan", "card"]
+        
+        lower_text = raw_text.lower()
+        if any(k in lower_text for k in aadhaar_keywords):
+            data["type"] = doc_type = "AADHAAR"
+            logger.info("Regex: Inferred type AADHAAR from keywords.")
+        elif any(k in lower_text for k in pan_keywords):
+            data["type"] = doc_type = "PAN CARD"
+            logger.info("Regex: Inferred type PAN CARD from keywords.")
+
+    # 2. Aadhaar ID (12 digits, optional spaces/dashes)
     aadhaar_pat = r'\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b'
-    # 2. PAN (ABCDE1234F)
+    # 3. PAN (ABCDE1234F pattern)
     pan_pat = r'\b[A-Z]{5}\d{4}[A-Z]\b'
-    # 3. DOB (DD/MM/YYYY or DD-MM-YYYY)
+    # 4. DOB (DD/MM/YYYY or DD-MM-YYYY)
     dob_pat = r'\b\d{2}[\s\/\-]\d{2}[\s\/\-]\d{4}\b'
 
     if data.get("id_number", "-") in ("-", "", None):
-        m = re.search(aadhaar_pat, text_clean)
-        if m:
-            data["id_number"] = m.group(0)
-            if doc_type == "UNKNOWN": data["type"] = "AADHAAR"
-            logger.info(f"Regex Boost: Found Aadhaar ID: {data['id_number']}")
-        else:
-            m = re.search(pan_pat, text_clean)
+        # Specific search based on detected type
+        if doc_type == "AADHAAR":
+            m = re.search(aadhaar_pat, text_clean)
             if m:
                 data["id_number"] = m.group(0)
-                if doc_type == "UNKNOWN": data["type"] = "PAN CARD"
-                logger.info(f"Regex Boost: Found PAN ID: {data['id_number']}")
+                logger.info(f"Regex Boost: Recovered Aadhaar ID: {data['id_number']}")
+        
+        # General search if still empty
+        if data.get("id_number", "-") == "-":
+            m = re.search(aadhaar_pat, text_clean)
+            if m:
+                data["id_number"] = m.group(0)
+                if doc_type == "UNKNOWN": data["type"] = "AADHAAR"
+            else:
+                m = re.search(pan_pat, text_clean)
+                if m:
+                    data["id_number"] = m.group(0)
+                    if doc_type == "UNKNOWN": data["type"] = "PAN CARD"
 
     if data.get("dob", "-") in ("-", "", None):
         m = re.search(dob_pat, text_clean)
         if m:
             data["dob"] = m.group(0).replace(" ", "/")
-            logger.info(f"Regex Boost: Found DOB: {data['dob']}")
+            logger.info(f"Regex Boost: Recovered DOB: {data['dob']}")
 
     if data.get("name", "-") in ("-", "", None):
-        # Fallback Name Search: Capitalized blocks that aren't headers
-        name_m = re.search(r'\b([A-Z]{3,}\s+[A-Z]{3,}(?:\s+[A-Z]{3,})?)\b', raw_text)
+        # Look for capitalized blocks that aren't common headers
+        # For PAN cards, the name is usually on its own line above Father's name
+        name_m = re.search(r'\b([A-Z]{3,}\s+[A-Z]{2,}(?:\s+[A-Z]{2,})?)\b', raw_text)
         if name_m:
             candidate = name_m.group(1).strip()
-            # Simple header blacklist
-            if not any(x in candidate for x in ["INDIA", "GOVERNMENT", "INCOME", "TAX", "CARD", "IDENTIFICATION"]):
+            blacklist = ["INDIA", "GOVERNMENT", "INCOME", "TAX", "CARD", "IDENTIFICATION", "AUTHORITY", "DEPARTMENT"]
+            if not any(x in candidate.upper() for x in blacklist):
                 data["name"] = candidate
-                logger.info(f"Regex Boost: Found Potential Name: {data['name']}")
+                logger.info(f"Regex Boost: Recovered Name: {data['name']}")
 
     return data
 
